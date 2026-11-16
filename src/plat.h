@@ -30,5 +30,8 @@ void     plat_set_bg(int r, int g, int b);           /* clear colour */
  * saturated to -1024..1023 like the GTE does. On the PS1 this is the GTE. */
 void     plat_set_matrix(const int *m9, const int *t3);
 int      plat_project(int x, int y, int z, int *sx, int *sy);
+/* Project n points at once. v = x,y,z,pad per point (SVECTOR layout,
+ * 4-byte aligned). sxy = packed (y << 16) | (x & 0xffff), sz = screen z. */
+void     plat_project_n(const int16_t *v, int n, int32_t *sxy, int32_t *sz);
 
 #endif

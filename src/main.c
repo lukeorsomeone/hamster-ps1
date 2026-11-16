@@ -50,9 +50,15 @@ static void setup_context(int w, int h, int r, int g, int b) {
 	SetDispMask(1);
 }
 
+/* Locked 30 fps: each frame is shown for at least two vblanks, so the frame
+ * rate is steady instead of flickering between 60 and lower. */
+#define FRAME_VBLANKS 2
+
 static void flip_buffers(void) {
+	static int last_flip = 0;
 	DrawSync(0);
-	VSync(0);
+	do VSync(0); while (VSync(-1) - last_flip < FRAME_VBLANKS);
+	last_flip = VSync(-1);
 
 	RenderBuffer *draw_buffer = &ctx.buffers[ctx.active_buffer];
 	RenderBuffer *disp_buffer = &ctx.buffers[ctx.active_buffer ^ 1];
@@ -164,6 +170,23 @@ int plat_project(int x, int y, int z, int *sx, int *sy) {
 	*sx = (int16_t)(sxy & 0xffff);
 	*sy = (int16_t)(sxy >> 16);
 	return sz;
+}
+
+/* three points per GTE RTPT: much cheaper than one RTPS call per point */
+void plat_project_n(const int16_t *v, int n, int32_t *sxy, int32_t *sz) {
+	int i = 0;
+	for (; i + 3 <= n; i += 3, v += 12) {
+		gte_ldv3(v, v + 4, v + 8);
+		gte_rtpt();
+		gte_stsxy3(&sxy[i], &sxy[i + 1], &sxy[i + 2]);
+		gte_stsz3(&sz[i], &sz[i + 1], &sz[i + 2]);
+	}
+	for (; i < n; i++, v += 4) {
+		gte_ldv0(v);
+		gte_rtps();
+		gte_stsxy(&sxy[i]);
+		gte_stsz(&sz[i]);
+	}
 }
 
 uint16_t plat_buttons(void) {

@@ -45,6 +45,13 @@ int plat_project(int x, int y, int z, int *sx, int *sy) {
 	*sy = py < -1024 ? -1024 : (py > 1023 ? 1023 : (int)py);
 	return cz;
 }
+void plat_project_n(const int16_t *v, int n, int32_t *sxy, int32_t *sz) {
+	for (int i = 0; i < n; i++, v += 4) {
+		int sx, sy, z = plat_project(v[0], v[1], v[2], &sx, &sy);
+		sxy[i] = (int32_t)(((uint32_t)(uint16_t)sy << 16) | (uint16_t)sx);
+		sz[i] = z < 0 ? 0 : (z > 65535 ? 65535 : z);   /* GTE SZ is unsigned 16-bit */
+	}
+}
 static int bgr = 40, bgg = 30, bgb = 52;
 void plat_set_bg(int r, int g, int b) { bgr = r; bgg = g; bgb = b; }
 

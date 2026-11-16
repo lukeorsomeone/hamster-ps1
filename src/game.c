@@ -216,6 +216,18 @@ static int oversize(const PV *a, const PV *b, const PV *c, const PV *d) {
 	return (mxx - mnx) > 1000 || (mxy - mny) > 500;
 }
 
+/* emit a quad whose corners are already known to be usable */
+static void emit_raw(const PV *a, const PV *b, const PV *c, const PV *d,
+                     int r, int g, int bl, int layer, int semi) {
+	int cross = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+	if (cross <= 0) return;                     /* back face */
+	int otz = layer;
+	if (layer == L_SORT)
+		otz = clampi((a->z + b->z + c->z + d->z) >> 4, 2, OT_LEN - 7);   /* avg z / 4 */
+	int16_t xy[8] = {a->x, a->y, b->x, b->y, c->x, c->y, d->x, d->y};
+	out_quad(otz, xy, r, g, bl, semi);
+}
+
 static void emit_pv(const PV *a, const PV *b, const PV *c, const PV *d,
                     int r, int g, int bl, int layer, int semi) {
 	if (!a->ok || !b->ok || !c->ok || !d->ok) return;
@@ -295,6 +307,130 @@ static void emit_any(const PV *a, const PV *b, const PV *c, const PV *d, int r, 
 	else           emit_pv(a, b, c, d, r, g, bl, layer, 0);
 }
 
+/* ---- static mesh
+ * The room, cage and props never move, so at startup they are captured once
+ * into world-space vertex and face lists (the same drawing code runs with
+ * capturing = 1). Each frame the GTE projects every vertex three at a time,
+ * then the faces are emitted from those results. That is far cheaper than
+ * transforming hundreds of separate boxes whenever the camera moves.
+ * Groups keep the capture order (the same-OT-slot rule depends on it) and are
+ * culled as a whole by a bounding sphere. */
+typedef struct { int16_t x, y, z, pad; } V4;          /* SVECTOR layout for the GTE */
+enum { F_QUAD, F_TRI, F_WIRE };
+typedef struct { uint16_t v[4]; int16_t layer; uint8_t r, g, b, kind, depth; } MFace;
+typedef struct { uint16_t v0, nv, f0, nf; int16_t c[3], rad; uint8_t cond; } MGroup;
+enum { MAXV = 2400, MAXF = 1600, MAXG = 400 };
+enum { C_ALWAYS, C_DAY, C_NIGHT };
+
+static V4 mv[MAXV] __attribute__((aligned(8)));
+static MFace mf[MAXF];
+static MGroup mg[MAXG];
+static PV mpv[MAXV];
+static int nmv = 0, nmf = 0, nmg = 0;
+static int capturing = 0, cap_cond = C_ALWAYS, cap_open = 0, cap_merge = 0;
+
+static void cg_begin(void) {
+	if (cap_open || nmg >= MAXG) return;
+	MGroup *g = &mg[nmg];
+	g->v0 = (uint16_t)nmv; g->f0 = (uint16_t)nmf; g->cond = (uint8_t)cap_cond;
+	cap_open = 1;
+}
+/* close the open group (unless merging, or force) and work out its sphere */
+static void cg_end(int force) {
+	if (!cap_open || (cap_merge && !force)) return;
+	cap_open = 0;
+	MGroup *g = &mg[nmg];
+	g->nv = (uint16_t)(nmv - g->v0); g->nf = (uint16_t)(nmf - g->f0);
+	if (!g->nv || !g->nf) { nmv = g->v0; nmf = g->f0; return; }
+	int lo[3] = {32767, 32767, 32767}, hi[3] = {-32768, -32768, -32768};
+	for (int i = g->v0; i < nmv; i++) {
+		const int16_t *p = &mv[i].x;
+		for (int a = 0; a < 3; a++) { if (p[a] < lo[a]) lo[a] = p[a]; if (p[a] > hi[a]) hi[a] = p[a]; }
+	}
+	int rad = 0;
+	for (int a = 0; a < 3; a++) { g->c[a] = (int16_t)((lo[a] + hi[a]) / 2); rad += (hi[a] - lo[a]) / 2 + 1; }
+	g->rad = (int16_t)rad;
+	nmg++;
+}
+static void cap_set_cond(int c) { cg_end(1); cap_cond = c; }
+
+static int cap_v(int x, int y, int z) {
+	if (nmv >= MAXV) return 0;
+	V4 *v = &mv[nmv];
+	v->x = (int16_t)x; v->y = (int16_t)y; v->z = (int16_t)z; v->pad = 0;
+	return nmv++;
+}
+static void cap_f(int kind, int a, int b, int c, int d, int r, int g, int bl, int layer, int depth) {
+	if (nmf >= MAXF) return;
+	MFace *f = &mf[nmf++];
+	f->v[0] = (uint16_t)a; f->v[1] = (uint16_t)b; f->v[2] = (uint16_t)c; f->v[3] = (uint16_t)d;
+	f->r = (uint8_t)r; f->g = (uint8_t)g; f->b = (uint8_t)bl;
+	f->kind = (uint8_t)kind; f->layer = (int16_t)layer; f->depth = (uint8_t)depth;
+}
+/* capture a point given in the space of m (during capture, view = identity) */
+static int cap_pt(const Mat *m, int x, int y, int z) {
+	int w[3];
+	xform(m, x, y, z, w);
+	return cap_v(w[0], w[1], w[2]);
+}
+
+static void quad_rec(const Mat *m, const int q[4][3], const PV *pre, int r, int g, int b,
+                     int layer, int depth);
+
+/* project vertices v0..v0+n-1 into mpv with the current GTE matrix */
+static void project_batch(int v0, int n) {
+	static int32_t sxy[48], sz[48];
+	while (n > 0) {
+		int k = n > 48 ? 48 : n;
+		plat_project_n(&mv[v0].x, k, sxy, sz);
+		for (int i = 0; i < k; i++) {
+			PV *o = &mpv[v0 + i];
+			int sx = (int16_t)(sxy[i] & 0xffff), sy = (int16_t)(sxy[i] >> 16);
+			o->z = sz[i];
+			o->front = sz[i] >= NEAR_Z;
+			o->rx = sx; o->ry = sy;
+			o->x = (int16_t)sx; o->y = (int16_t)sy;
+			o->ok = o->front && sx > -1000 && sx < 1000 && sy > -1000 && sy < 1000;
+		}
+		v0 += k; n -= k;
+	}
+}
+
+static void wire_pv(const PV *a, const PV *b, int thick, int r, int g, int bl);
+
+static void draw_mesh(const Mat *view_m, int night) {
+	use_matrix(view_m);
+	for (int gi = 0; gi < nmg; gi++) {
+		const MGroup *g = &mg[gi];
+		if ((g->cond == C_DAY && night) || (g->cond == C_NIGHT && !night)) continue;
+		int c[3];
+		xform(view_m, g->c[0], g->c[1], g->c[2], c);
+		if (!sphere_visible(c, g->rad)) continue;
+		project_batch(g->v0, g->nv);
+		use_matrix(view_m);
+		for (int fi = g->f0; fi < g->f0 + g->nf; fi++) {
+			const MFace *f = &mf[fi];
+			const PV *a = &mpv[f->v[0]], *b = &mpv[f->v[1]], *cc = &mpv[f->v[2]], *d = &mpv[f->v[3]];
+			if (f->kind == F_WIRE) { wire_pv(a, b, f->depth, f->r, f->g, f->b); continue; }
+			if (f->kind == F_TRI) {
+				int cross = (b->x - a->x) * (cc->y - a->y) - (b->y - a->y) * (cc->x - a->x);
+				if (cross < 0) emit_pv(a, cc, b, b, f->r, f->g, f->b, f->layer, 0);
+				else           emit_pv(a, b, cc, cc, f->r, f->g, f->b, f->layer, 0);
+				continue;
+			}
+			if (a->ok && b->ok && cc->ok && d->ok && !oversize(a, b, cc, d)) {
+				emit_raw(a, b, cc, d, f->r, f->g, f->b, f->layer, 0);
+				continue;
+			}
+			/* near the camera or off-screen: split it up (rare) */
+			int q[4][3];
+			PV pre[4] = {*a, *b, *cc, *d};
+			for (int k = 0; k < 4; k++) { q[k][0] = mv[f->v[k]].x; q[k][1] = mv[f->v[k]].y; q[k][2] = mv[f->v[k]].z; }
+			quad_rec(view_m, (const int (*)[3])q, pre, f->r, f->g, f->b, f->layer, f->depth);
+		}
+	}
+}
+
 /* thin rod between two projected points, drawn as one flat strip facing the
  * camera: 2 projections instead of a box's 8 */
 static void wire_pv(const PV *a, const PV *b, int thick, int r, int g, int bl) {
@@ -317,6 +453,13 @@ static void wire_pv(const PV *a, const PV *b, int thick, int r, int g, int bl) {
 
 static void wire(const Mat *m, int x0, int y0, int z0, int x1, int y1, int z1, int thick,
                  int r, int g, int b) {
+	if (capturing) {
+		cg_begin();
+		int va = cap_pt(m, x0, y0, z0), vb = cap_pt(m, x1, y1, z1);
+		cap_f(F_WIRE, va, vb, vb, vb, r, g, b, L_SORT, thick);
+		cg_end(0);
+		return;
+	}
 	PV a, c;
 	project_pt(m, x0, y0, z0, &a);
 	project_pt(m, x1, y1, z1, &c);
@@ -326,6 +469,20 @@ static void wire(const Mat *m, int x0, int y0, int z0, int x1, int y1, int z1, i
 /* box centred at (cx,cy,cz) in the space of matrix m (model->camera) */
 static void box(const Mat *m, int cx, int cy, int cz, int hx, int hy, int hz,
                 int r, int g, int b, int layer) {
+	if (capturing) {
+		cg_begin();
+		int v0 = nmv;
+		for (int i = 0; i < 8; i++)
+			cap_pt(m, cx + ((i & 1) ? hx : -hx), cy + ((i & 2) ? hy : -hy), cz + ((i & 4) ? hz : -hz));
+		for (int f = 0; f < 6; f++) {
+			const uint8_t *q = FACES[f];
+			int s = SHADE[f];
+			cap_f(F_QUAD, v0 + q[0], v0 + q[1], v0 + q[2], v0 + q[3],
+			      (r * s) >> 8, (g * s) >> 8, (b * s) >> 8, layer, 1);
+		}
+		cg_end(0);
+		return;
+	}
 	/* quick reject: bounding sphere entirely behind or beside the camera */
 	{
 		int c[3];
@@ -684,7 +841,23 @@ static void update_hamster(void) {
 
 static int pressed(uint16_t held, uint16_t b) { return (held & b) && !(prev_held & b); }
 
+static void draw_room(void);
+static void draw_cage(void);
+static void draw_props_static(void);
+
+/* capture the room, cage and props into the static mesh, once */
+static void build_mesh(void) {
+	mat_ident(&view);                  /* model matrices become model->world */
+	capturing = 1;
+	draw_room();
+	draw_cage();
+	draw_props_static();
+	cg_end(1);
+	capturing = 0;
+}
+
 void game_init(void) {
+	build_mesh();
 	ham.x = -40; ham.z = 0; ham.yaw = 2048;
 	ham.state = S_IDLE; ham.timer = 90;
 }
@@ -713,9 +886,21 @@ static void update_menu(uint16_t held) {
 	}
 }
 
+/* camera glides towards its target; runs at the fixed 60 Hz update rate so
+ * it feels the same however fast frames are drawn */
+static void ease_camera(void) {
+	int ttx = 0, tty = -170, ttz = 0, tdist = 920;
+	if (zoom && ham.state != S_SLEEP) { ttx = ham.x; tty = -45; ttz = ham.z; tdist = 440; }
+	cam_tx += (ttx - cam_tx) / 8;
+	cam_ty += (tty - cam_ty) / 8;
+	cam_tz += (ttz - cam_tz) / 8;
+	cam_dist += (tdist - cam_dist) / 8;
+}
+
 void game_update(uint16_t held) {
 	frame++;
 	upd_count++;
+	ease_camera();
 
 	if (title) {
 		/* camera holds still on the title so the scene stays cached */
@@ -824,13 +1009,6 @@ static void update_light(void) {
 }
 
 static void setup_camera(void) {
-	int ttx = 0, tty = -170, ttz = 0, tdist = 920;
-	if (zoom && ham.state != S_SLEEP) { ttx = ham.x; tty = -45; ttz = ham.z; tdist = 440; }
-	cam_tx += (ttx - cam_tx) / 8;
-	cam_ty += (tty - cam_ty) / 8;
-	cam_tz += (ttz - cam_tz) / 8;
-	cam_dist += (tdist - cam_dist) / 8;
-
 	Mat rx, ry;
 	mat_rotx(&rx, cam_pitch);
 	mat_roty(&ry, cam_yaw);
@@ -855,36 +1033,34 @@ static void setup_camera(void) {
 /* a flat grid of quads: o = top-left corner, u = across, v = down (as seen from the front) */
 static void panel(const int *o, const int *u, const int *v, int nu, int nv,
                   int r0, int g0, int b0, int r1, int g1, int b1, int stripe, int layer) {
-	static PV grid[21 * 11];
-	static uint8_t done[21 * 11];
-	for (int k = 0; k < (nu + 1) * (nv + 1); k++) done[k] = 0;
-	/* tile size, for the visibility radius */
-	int tr = 0;
-	for (int a = 0; a < 3; a++) tr += iabs(u[a]) / nu / 2 + iabs(v[a]) / nv / 2;
+	/* captured only (static scenery): one group, grid corners shared */
+	cg_end(1);
+	cg_begin();
+	int v0 = nmv;
+	for (int jj = 0; jj <= nv; jj++)
+		for (int ii = 0; ii <= nu; ii++)
+			cap_v(o[0] + u[0] * ii / nu + v[0] * jj / nv,
+			      o[1] + u[1] * ii / nu + v[1] * jj / nv,
+			      o[2] + u[2] * ii / nu + v[2] * jj / nv);
 	for (int j = 0; j < nv; j++)
 		for (int i = 0; i < nu; i++) {
-			int w[4][3];
-			for (int k = 0; k < 4; k++) {
-				int ii = i + (k & 1), jj = j + (k >> 1);
-				for (int a = 0; a < 3; a++) w[k][a] = o[a] + u[a] * ii / nu + v[a] * jj / nv;
-			}
-			int c[3];
-			xform(&view, (w[0][0] + w[3][0]) / 2, (w[0][1] + w[3][1]) / 2, (w[0][2] + w[3][2]) / 2, c);
-			if (!sphere_visible(c, tr)) continue;
-			PV pre[4];
-			for (int k = 0; k < 4; k++) {
-				int gi = (j + (k >> 1)) * (nu + 1) + i + (k & 1);
-				if (!done[gi]) { project_pt(&view, w[k][0], w[k][1], w[k][2], &grid[gi]); done[gi] = 1; }
-				pre[k] = grid[gi];
-			}
+			int tl = v0 + j * (nu + 1) + i, bl = tl + nu + 1;
 			int alt = stripe == 1 ? (i & 1) : (stripe == 2 ? ((i + j * 3) % 4 == 0) : 0);
-			if (alt) quad_rec(&view, (const int (*)[3])w, pre, r1, g1, b1, layer, 0);
-			else     quad_rec(&view, (const int (*)[3])w, pre, r0, g0, b0, layer, 0);
+			if (alt) cap_f(F_QUAD, tl, tl + 1, bl, bl + 1, r1, g1, b1, layer, 0);
+			else     cap_f(F_QUAD, tl, tl + 1, bl, bl + 1, r0, g0, b0, layer, 0);
 		}
+	cg_end(1);
 }
 
 /* single triangle, visible from either side */
 static void tri_world(const Mat *m, const int *a, const int *b, const int *c, int r, int g, int bl, int layer) {
+	if (capturing) {
+		cg_begin();
+		int va = cap_pt(m, a[0], a[1], a[2]), vb = cap_pt(m, b[0], b[1], b[2]), vc = cap_pt(m, c[0], c[1], c[2]);
+		cap_f(F_TRI, va, vb, vc, vc, r, g, bl, layer, 0);
+		cg_end(0);
+		return;
+	}
 	PV pa, pb, pc;
 	project_pt(m, a[0], a[1], a[2], &pa);
 	project_pt(m, b[0], b[1], b[2], &pb);
@@ -899,18 +1075,34 @@ static void floor_disc(int cx, int cz, int rad, int r, int g, int b) {
 	Mat m;
 	model_mat(&m, 0, 0, 0, 0, 0);
 	int ctr[3] = {cx, ROOM_FLOOR - 1, cz};
+	cap_merge = 1;                       /* the whole disc is one group */
 	for (int i = 0; i < 8; i++) {
 		int a0 = i * 512 + 256, a1 = a0 + 512;
 		int p0[3] = {cx + (fcos(a0) * rad >> 12), ROOM_FLOOR - 1, cz + (fsin(a0) * rad >> 12)};
 		int p1[3] = {cx + (fcos(a1) * rad >> 12), ROOM_FLOOR - 1, cz + (fsin(a1) * rad >> 12)};
 		tri_world(&m, ctr, p0, p1, r, g, b, L_DECO);
 	}
+	cap_merge = 0;
+	cg_end(1);
 }
 
+/* the view out of the window: hill + sun by day, moon and stars by night */
+static void draw_sky(const Mat *m, int wy, int wz, int night) {
+	if (night) {
+		box(m, 180, wy - 120, wz + 4, 30, 30, 2, 250, 245, 200, L_DECO);
+		for (int i = 0; i < 7; i++)
+			box(m, -320 + i * 100, wy - 200 + ((i * 67) % 160), wz + 5, 5, 5, 1, 255, 255, 230, L_DECO);
+	} else {
+		box(m, -190, wy - 120, wz + 4, 40, 40, 2, 255, 240, 160, L_DECO);
+	}
+	box(m, 0, wy + 180, wz + 6, 352, 60, 2, night ? 40 : 120, night ? 70 : 190, night ? 60 : 110, L_DECO);
+	box(m, 0, wy, wz + 8, 352, 240, 2, night ? 30 : 190, night ? 40 : 225, night ? 100 : 255, L_DECO);
+}
+
+/* captured once into the static mesh (see build_mesh) */
 static void draw_room(void) {
 	Mat m;
 	model_mat(&m, 0, 0, 0, 0, 0);
-	int night = is_night() && !title && !menu;
 
 	/* floor: wooden planks */
 	{
@@ -921,15 +1113,16 @@ static void draw_room(void) {
 	{
 		int o[3] = {-SIDE_WALL, ROOM_TOP, BACK_WALL}, u[3] = {SIDE_WALL * 2, 0, 0};
 		int v1[3] = {0, DADO_Y - ROOM_TOP, 0}, o2[3] = {-SIDE_WALL, DADO_Y, BACK_WALL}, v2[3] = {0, ROOM_FLOOR - DADO_Y, 0};
-		panel(o, u, v1, 16, 1, 236, 214, 200, 222, 194, 184, 1, L_ROOM);
+		/* wide, cheery stripes: 8 per wall (was 16) */
+		panel(o, u, v1, 8, 1, 236, 214, 200, 222, 194, 184, 1, L_ROOM);
 		panel(o2, u, v2, 4, 1, 170, 196, 186, 170, 196, 186, 0, L_ROOM);
 		int lo[3] = {-SIDE_WALL, ROOM_TOP, FRONT_WALL}, lu[3] = {0, 0, 3000};
 		int lo2[3] = {-SIDE_WALL, DADO_Y, FRONT_WALL};
-		panel(lo, lu, v1, 16, 1, 236, 214, 200, 222, 194, 184, 1, L_ROOM);
+		panel(lo, lu, v1, 8, 1, 236, 214, 200, 222, 194, 184, 1, L_ROOM);
 		panel(lo2, lu, v2, 4, 1, 170, 196, 186, 170, 196, 186, 0, L_ROOM);
 		int ro[3] = {SIDE_WALL, ROOM_TOP, BACK_WALL}, ru[3] = {0, 0, -3000};
 		int ro2[3] = {SIDE_WALL, DADO_Y, BACK_WALL};
-		panel(ro, ru, v1, 16, 1, 236, 214, 200, 222, 194, 184, 1, L_ROOM);
+		panel(ro, ru, v1, 8, 1, 236, 214, 200, 222, 194, 184, 1, L_ROOM);
 		panel(ro2, ru, v2, 4, 1, 170, 196, 186, 170, 196, 186, 0, L_ROOM);
 	}
 	/* skirting boards + dado rails (cream trim) */
@@ -957,16 +1150,10 @@ static void draw_room(void) {
 		box(&m, -360, wy, wz, 19, 262, 15, 242, 237, 225, L_DECO);
 		box(&m,  360, wy, wz, 19, 262, 15, 242, 237, 225, L_DECO);
 		box(&m, 0, wy, wz, 11, 248, 11, 242, 237, 225, L_DECO);
-		/* sky: hill + sun by day, moon and stars by night */
-		if (night) {
-			box(&m, 180, wy - 120, wz + 4, 30, 30, 2, 250, 245, 200, L_DECO);
-			for (int i = 0; i < 7; i++)
-				box(&m, -320 + i * 100, wy - 200 + ((i * 67) % 160), wz + 5, 5, 5, 1, 255, 255, 230, L_DECO);
-		} else {
-			box(&m, -190, wy - 120, wz + 4, 40, 40, 2, 255, 240, 160, L_DECO);
-		}
-		box(&m, 0, wy + 180, wz + 6, 352, 60, 2, night ? 40 : 120, night ? 70 : 190, night ? 60 : 110, L_DECO);
-		box(&m, 0, wy, wz + 8, 352, 240, 2, night ? 30 : 190, night ? 40 : 225, night ? 100 : 255, L_DECO);
+		/* both skies are captured; only one is drawn at a time */
+		cap_set_cond(C_DAY);   draw_sky(&m, wy, wz, 0);
+		cap_set_cond(C_NIGHT); draw_sky(&m, wy, wz, 1);
+		cap_set_cond(C_ALWAYS);
 	}
 
 	/* framed pictures on the side walls */
@@ -987,10 +1174,10 @@ static void draw_room(void) {
 			box(&m, bx, top + sh * 275 + 10, bz, 230, 10, 110, 170, 120, 80, L_DECO);
 		static const uint8_t BOOK[5][3] = {{200, 70, 70}, {70, 110, 190}, {230, 190, 80}, {80, 160, 110}, {150, 90, 170}};
 		for (int sh = 0; sh < 3; sh++)
-			for (int k = 0; k < 7; k++) {
+			for (int k = 0; k < 5; k++) {      /* 5 chunky books per shelf */
 				int h = 90 + ((k * 37 + sh * 11) % 60);
 				const uint8_t *c = BOOK[(k + sh * 2) % 5];
-				box(&m, bx - 190 + k * 52, top + (sh + 1) * 275 - h, bz + 20, 22, h, 80, c[0], c[1], c[2], L_DECO);
+				box(&m, bx - 176 + k * 88, top + (sh + 1) * 275 - h, bz + 20, 32, h, 80, c[0], c[1], c[2], L_DECO);
 			}
 		box(&m, bx, (top + ROOM_FLOOR) / 2, bz + 105, 230, 550, 6, 120, 80, 52, L_DECO);   /* back */
 	}
@@ -1051,18 +1238,21 @@ static void draw_cage(void) {
 				}
 			built = 1;
 		}
+		cg_end(1);
+		cg_begin();
+		int v0 = nmv;
+		for (int iz = 0; iz <= NZ; iz++)
+			for (int ix = 0; ix <= NX; ix++)
+				cap_v(-CAGE_X - 5 + ix * (CAGE_X * 2 + 10) / NX, hy[iz][ix],
+				      -CAGE_Z - 5 + iz * (CAGE_Z * 2 + 10) / NZ);
 		for (int iz = 0; iz < NZ; iz++)
 			for (int ix = 0; ix < NX; ix++) {
-				PV p[4];
-				int xs[2] = {-CAGE_X - 5 + ix * (CAGE_X * 2 + 10) / NX, -CAGE_X - 5 + (ix + 1) * (CAGE_X * 2 + 10) / NX};
-				int zs[2] = {-CAGE_Z - 5 + iz * (CAGE_Z * 2 + 10) / NZ, -CAGE_Z - 5 + (iz + 1) * (CAGE_Z * 2 + 10) / NZ};
 				/* TL, TR, BL, BR seen from above: far-left, far-right, near-left, near-right */
-				const int gx[4] = {0, 1, 0, 1}, gz[4] = {1, 1, 0, 0};
-				for (int k = 0; k < 4; k++)
-					project_pt(&view, xs[gx[k]], hy[iz + gz[k]][ix + gx[k]], zs[gz[k]], &p[k]);
+				int nl = v0 + iz * (NX + 1) + ix, fl = nl + NX + 1;
 				int v = ((ix * 7 + iz * 13) % 5) * 7;
-				emit_pv(&p[0], &p[1], &p[2], &p[3], 226 + v / 3, 200 + v / 2, 150 + v / 2, L_BEDDING, 0);
+				cap_f(F_QUAD, fl, fl + 1, nl, nl + 1, 226 + v / 3, 200 + v / 2, 150 + v / 2, L_BEDDING, 2);
 			}
+		cg_end(1);
 	}
 
 	/* white wire bars on the back and both sides */
@@ -1071,6 +1261,7 @@ static void draw_cage(void) {
 	(void)hy;
 	int y0 = TRAY_TOP, y1 = CAGE_TOP;
 	(void)cy;
+	cap_merge = 1;                       /* all the bars are one group */
 	for (int x = -CAGE_X - 10; x <= CAGE_X + 10; x += 32)
 		wire(&m, x, y0, CAGE_Z + 10, x, y1, CAGE_Z + 10, 2, wr, wg, wb);
 	for (int z = -CAGE_Z - 10; z <= CAGE_Z + 10; z += 32) {
@@ -1089,6 +1280,8 @@ static void draw_cage(void) {
 			wire(&m,  CAGE_X + 10, y, za,  CAGE_X + 10, y, zb, 3, wr, wg, wb);
 		}
 	}
+	cap_merge = 0;
+	cg_end(1);
 }
 
 static void draw_bowl_food(void) {
@@ -1411,7 +1604,7 @@ void game_render(void) {
 	for (int i = 0; i < 9; i++) key[i] = view.m[i];
 	key[9] = view.t[0]; key[10] = view.t[1]; key[11] = view.t[2];
 	key[12] = is_night() && !title && !menu;     /* window sky changes */
-	if (cache_begin(&c_static, key, 13)) { draw_room(); draw_cage(); draw_props_static(); cache_end(); }
+	if (cache_begin(&c_static, key, 13)) { draw_mesh(&view, key[12]); cache_end(); }
 	key[12] = wheel_angle;
 	if (cache_begin(&c_wheel, key, 13)) { draw_wheel(); cache_end(); }
 	key[12] = food;
