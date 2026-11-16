@@ -1,0 +1,17 @@
+# build output
+build/
+*.bin
+*.cue
+*.exe
+*.elf
+*.map
+
+# PC preview renders
+pctest/out/
+pctest/*.ppm
+
+# leftover from the PSn00bSDK template (the game lives in src/)
+/main.c
+
+.vscode/
+*.swp
