@@ -333,6 +333,7 @@ static MGroup mg[MAXG];
 static PV mpv[MAXV];
 static int nmv = 0, nmf = 0, nmg = 0;
 static int capturing = 0, cap_cond = C_ALWAYS, cap_open = 0, cap_merge = 0;
+static int cap_mask = 0x3f;          /* which box faces to capture (bit = FACES index) */
 
 static void cg_begin(void) {
 	if (cap_open || nmg >= MAXG) return;
@@ -480,6 +481,7 @@ static void box(const Mat *m, int cx, int cy, int cz, int hx, int hy, int hz,
 		for (int i = 0; i < 8; i++)
 			cap_pt(m, cx + ((i & 1) ? hx : -hx), cy + ((i & 2) ? hy : -hy), cz + ((i & 4) ? hz : -hz));
 		for (int f = 0; f < 6; f++) {
+			if (!(cap_mask & (1 << f))) continue;
 			const uint8_t *q = FACES[f];
 			int s = SHADE[f];
 			cap_f(F_QUAD, v0 + q[0], v0 + q[1], v0 + q[2], v0 + q[3],
@@ -1209,6 +1211,30 @@ static void draw_room(void) {
 
 /* ---- the cage: 80 x 50 cm, open front (diorama style) like the Godot game */
 
+/* A long box cut into n pieces along x (axis 0) or z (axis 2). The OT sorts a
+ * face by its average depth, so one 60 cm wall face could sort in front of the
+ * pet standing beside it; short pieces each sort by where they really are.
+ * The joins between pieces get no end faces. Capture only. */
+static void split_box(const Mat *m, int axis, int n, int cx, int cy, int cz, int hx, int hy, int hz,
+                      int r, int g, int b) {
+	int lo = axis == 0 ? cx - hx : cz - hz, len = axis == 0 ? hx * 2 : hz * 2;
+	for (int i = 0; i < n; i++) {
+		int a0 = lo + len * i / n, a1 = lo + len * (i + 1) / n;
+		int c = (a0 + a1) / 2, h = (a1 - a0 + 1) / 2;
+		cap_mask = 0x3f;
+		if (axis == 0) {             /* drop -x (bit 3) / +x (bit 2) ends at the joins */
+			if (i > 0) cap_mask &= ~(1 << 3);
+			if (i < n - 1) cap_mask &= ~(1 << 2);
+			box(m, c, cy, cz, h, hy, hz, r, g, b, L_SORT);
+		} else {                     /* drop -z (bit 0) / +z (bit 1) ends at the joins */
+			if (i > 0) cap_mask &= ~(1 << 0);
+			if (i < n - 1) cap_mask &= ~(1 << 1);
+			box(m, cx, cy, c, hx, hy, h, r, g, b, L_SORT);
+		}
+	}
+	cap_mask = 0x3f;
+}
+
 static void draw_cage(void) {
 	Mat m;
 	model_mat(&m, 0, 0, 0, 0, 0);
@@ -1216,14 +1242,14 @@ static void draw_cage(void) {
 
 	/* tray base + back and side walls (no front wall: clear panel) */
 	box(&m, 0, TABLE_TOP - 4, 0, CAGE_X + 15, 4, CAGE_Z + 15, tr, tg, tb, L_TRAY);
-	box(&m, 0, (TRAY_TOP + TABLE_TOP) / 2,  CAGE_Z + 10, CAGE_X + 15, (TABLE_TOP - TRAY_TOP) / 2, 5, tr, tg, tb, L_SORT);
-	box(&m, -CAGE_X - 10, (TRAY_TOP + TABLE_TOP) / 2, 0, 5, (TABLE_TOP - TRAY_TOP) / 2, CAGE_Z + 10, tr, tg, tb, L_SORT);
-	box(&m,  CAGE_X + 10, (TRAY_TOP + TABLE_TOP) / 2, 0, 5, (TABLE_TOP - TRAY_TOP) / 2, CAGE_Z + 10, tr, tg, tb, L_SORT);
+	split_box(&m, 0, 6, 0, (TRAY_TOP + TABLE_TOP) / 2,  CAGE_Z + 10, CAGE_X + 15, (TABLE_TOP - TRAY_TOP) / 2, 5, tr, tg, tb);
+	split_box(&m, 2, 4, -CAGE_X - 10, (TRAY_TOP + TABLE_TOP) / 2, 0, 5, (TABLE_TOP - TRAY_TOP) / 2, CAGE_Z + 10, tr, tg, tb);
+	split_box(&m, 2, 4,  CAGE_X + 10, (TRAY_TOP + TABLE_TOP) / 2, 0, 5, (TABLE_TOP - TRAY_TOP) / 2, CAGE_Z + 10, tr, tg, tb);
 	/* rim all round, including over the clear front panel */
-	box(&m, 0, TRAY_TOP, -CAGE_Z - 10, CAGE_X + 18, 5, 8, 92, 152, 196, L_SORT);
-	box(&m, 0, TRAY_TOP,  CAGE_Z + 10, CAGE_X + 18, 5, 8, 92, 152, 196, L_SORT);
-	box(&m, -CAGE_X - 10, TRAY_TOP, 0, 8, 5, CAGE_Z + 10, 92, 152, 196, L_SORT);
-	box(&m,  CAGE_X + 10, TRAY_TOP, 0, 8, 5, CAGE_Z + 10, 92, 152, 196, L_SORT);
+	split_box(&m, 0, 6, 0, TRAY_TOP, -CAGE_Z - 10, CAGE_X + 18, 5, 8, 92, 152, 196);
+	split_box(&m, 0, 6, 0, TRAY_TOP,  CAGE_Z + 10, CAGE_X + 18, 5, 8, 92, 152, 196);
+	split_box(&m, 2, 4, -CAGE_X - 10, TRAY_TOP, 0, 8, 5, CAGE_Z + 10, 92, 152, 196);
+	split_box(&m, 2, 4,  CAGE_X + 10, TRAY_TOP, 0, 8, 5, CAGE_Z + 10, 92, 152, 196);
 	/* front panel edges (the clear plastic itself is invisible on the PS1) */
 	box(&m, -CAGE_X - 10, (TRAY_TOP + TABLE_TOP) / 2, -CAGE_Z - 10, 4, (TABLE_TOP - TRAY_TOP) / 2, 4, 200, 225, 240, L_SORT);
 	box(&m,  CAGE_X + 10, (TRAY_TOP + TABLE_TOP) / 2, -CAGE_Z - 10, 4, (TABLE_TOP - TRAY_TOP) / 2, 4, 200, 225, 240, L_SORT);
@@ -1345,10 +1371,13 @@ static void draw_props_static(void) {
 		tri_world(&m, k0, k1, k2, 230, 191, 140, L_SORT);
 		/* roof slabs, tilted with the roll angle */
 		Mat rl, rr;
-		model_mat(&rl, hx - HOUSE_W / 2, -H - 20, hz, 0, -450);   /* y is down: negative roll lifts the inner edge */
-		model_mat(&rr, hx + HOUSE_W / 2, -H - 20, hz, 0, 450);
-		box(&rl, 0, 0, 0, HOUSE_W / 2 + 18, 5, HOUSE_D + 12, 209, 158, 115, L_SORT);
-		box(&rr, 0, 0, 0, HOUSE_W / 2 + 18, 5, HOUSE_D + 12, 209, 158, 115, L_SORT);
+		/* slope matches the gables (38 up over 60 across = 368); each slab sits on
+		 * its slope with its inner end at the peak and a little overhang at the eave.
+		 * y is down, so a negative roll lifts the left slab's inner edge. */
+		model_mat(&rl, hx - 38, -H - 20, hz, 0, -368);
+		model_mat(&rr, hx + 38, -H - 20, hz, 0, 368);
+		box(&rl, 0, 0, 0, 42, 5, HOUSE_D + 12, 209, 158, 115, L_SORT);
+		box(&rr, 0, 0, 0, 42, 5, HOUSE_D + 12, 209, 158, 115, L_SORT);
 	}
 
 	/* chew log near the front */
