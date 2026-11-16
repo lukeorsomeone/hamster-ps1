@@ -110,6 +110,11 @@ static void xform(const Mat *m, int x, int y, int z, int *o) {
 #define L_SHADOW   (OT_LEN - 6)
 
 static Mat view;
+/* Pulls faces this many OT slots towards the camera. Eyes, noses, bellies and
+ * stripes sit only a unit or two proud of the body, so by plain average depth
+ * they often land in the same slot as the body face and vanish or flicker. */
+static int sort_bias = 0;
+#define DETAIL(n, stmt) do { sort_bias = (n); stmt; sort_bias = 0; } while (0)
 static int light_r = 256, light_g = 256, light_b = 256;   /* day/night tint */
 
 
@@ -223,7 +228,7 @@ static void emit_raw(const PV *a, const PV *b, const PV *c, const PV *d,
 	if (cross <= 0) return;                     /* back face */
 	int otz = layer;
 	if (layer == L_SORT)
-		otz = clampi((a->z + b->z + c->z + d->z) >> 4, 2, OT_LEN - 7);   /* avg z / 4 */
+		otz = clampi(((a->z + b->z + c->z + d->z) >> 4) - sort_bias, 2, OT_LEN - 7);   /* avg z / 4 */
 	int16_t xy[8] = {a->x, a->y, b->x, b->y, c->x, c->y, d->x, d->y};
 	out_quad(otz, xy, r, g, bl, semi);
 }
@@ -236,7 +241,7 @@ static void emit_pv(const PV *a, const PV *b, const PV *c, const PV *d,
 	if (cross <= 0) return;                     /* back face */
 	int otz = layer;
 	if (layer == L_SORT)
-		otz = clampi((a->z + b->z + c->z + d->z) >> 4, 2, OT_LEN - 7);   /* avg z / 4 */
+		otz = clampi(((a->z + b->z + c->z + d->z) >> 4) - sort_bias, 2, OT_LEN - 7);   /* avg z / 4 */
 	int16_t xy[8] = {a->x, a->y, b->x, b->y, c->x, c->y, d->x, d->y};
 	out_quad(otz, xy, r, g, bl, semi);
 }
@@ -1340,8 +1345,8 @@ static void draw_props_static(void) {
 		tri_world(&m, k0, k1, k2, 230, 191, 140, L_SORT);
 		/* roof slabs, tilted with the roll angle */
 		Mat rl, rr;
-		model_mat(&rl, hx - HOUSE_W / 2, -H - 20, hz, 0, 450);
-		model_mat(&rr, hx + HOUSE_W / 2, -H - 20, hz, 0, -450);
+		model_mat(&rl, hx - HOUSE_W / 2, -H - 20, hz, 0, -450);   /* y is down: negative roll lifts the inner edge */
+		model_mat(&rr, hx + HOUSE_W / 2, -H - 20, hz, 0, 450);
 		box(&rl, 0, 0, 0, HOUSE_W / 2 + 18, 5, HOUSE_D + 12, 209, 158, 115, L_SORT);
 		box(&rr, 0, 0, 0, HOUSE_W / 2 + 18, 5, HOUSE_D + 12, 209, 158, 115, L_SORT);
 	}
@@ -1444,31 +1449,31 @@ static void draw_pet(void) {
 	switch (species) {
 	case SP_HAMSTER:
 		box(&m, 0, -30, -4, 31, 26, 40, fr, fg, fb, L_SORT);                 /* body  */
-		box(&m, 0, -16, 2, 25, 14, 35, ar, ag, ab, L_SORT);                  /* belly */
+		DETAIL(1, box(&m, 0, -16, 2, 25, 14, 35, ar, ag, ab, L_SORT));                  /* belly */
 		box(&m, 0, -38 + nod, 40, 24, 22, 20, fr, fg, fb, L_SORT);           /* head  */
 		box(&m, -19, -27 + nod, 46, 9, 10, 11, ar, ag, ab, L_SORT);          /* cheeks */
 		box(&m,  19, -27 + nod, 46, 9, 10, 11, ar, ag, ab, L_SORT);
-		box(&m, 0, -31 + nod, 61, 10, 8, 3, ar, ag, ab, L_SORT);             /* snout */
-		box(&m, 0, -34 + nod, 64, 4, 3, 2, 240, 120, 140, L_SORT);           /* nose  */
-		box(&m, -12, -45 + nod, 60, 4, 4, 2, 20, 16, 24, L_SORT);            /* eyes  */
-		box(&m,  12, -45 + nod, 60, 4, 4, 2, 20, 16, 24, L_SORT);
+		DETAIL(1, box(&m, 0, -31 + nod, 61, 10, 8, 3, ar, ag, ab, L_SORT));             /* snout */
+		DETAIL(3, box(&m, 0, -34 + nod, 64, 4, 3, 2, 240, 120, 140, L_SORT));           /* nose  */
+		DETAIL(3, box(&m, -12, -45 + nod, 60, 4, 4, 2, 20, 16, 24, L_SORT));            /* eyes  */
+		DETAIL(3, box(&m,  12, -45 + nod, 60, 4, 4, 2, 20, 16, 24, L_SORT));
 		box(&m, -16, -63 + nod, 34, 8, 7, 3, fr, fg, fb, L_SORT);            /* ears  */
 		box(&m,  16, -63 + nod, 34, 8, 7, 3, fr, fg, fb, L_SORT);
-		box(&m, -16, -63 + nod, 37, 5, 5, 1, 240, 150, 160, L_SORT);
-		box(&m,  16, -63 + nod, 37, 5, 5, 1, 240, 150, 160, L_SORT);
+		DETAIL(1, box(&m, -16, -63 + nod, 37, 5, 5, 1, 240, 150, 160, L_SORT));
+		DETAIL(1, box(&m,  16, -63 + nod, 37, 5, 5, 1, 240, 150, 160, L_SORT));
 		box(&m, 0, -26, -45, 5, 5, 4, fr, fg, fb, L_SORT);                   /* tail  */
 		feet(&m, 18, 26, -24, step, -4);
 		break;
 
 	case SP_GUINEA:
 		box(&m, 0, -34, -6, 38, 30, 54, fr, fg, fb, L_SORT);                 /* body  */
-		box(&m, 0, -44, -30, 30, 18, 26, ar, ag, ab, L_SORT);                /* saddle patch */
+		DETAIL(1, box(&m, 0, -44, -30, 30, 18, 26, ar, ag, ab, L_SORT));                /* saddle patch */
 		box(&m, 0, -40 + nod, 54, 30, 25, 20, fr, fg, fb, L_SORT);           /* head  */
-		box(&m, 0, -42 + nod, 70, 12, 22, 6, ar, ag, ab, L_SORT);            /* blaze */
-		box(&m, 0, -30 + nod, 76, 12, 8, 3, ar, ag, ab, L_SORT);             /* muzzle */
-		box(&m, 0, -33 + nod, 79, 5, 3, 2, 210, 120, 130, L_SORT);           /* nose  */
-		box(&m, -18, -48 + nod, 72, 5, 5, 2, 20, 16, 24, L_SORT);            /* eyes  */
-		box(&m,  18, -48 + nod, 72, 5, 5, 2, 20, 16, 24, L_SORT);
+		DETAIL(1, box(&m, 0, -42 + nod, 70, 12, 22, 6, ar, ag, ab, L_SORT));            /* blaze */
+		DETAIL(2, box(&m, 0, -30 + nod, 76, 12, 8, 3, ar, ag, ab, L_SORT));             /* muzzle */
+		DETAIL(3, box(&m, 0, -33 + nod, 79, 5, 3, 2, 210, 120, 130, L_SORT));           /* nose  */
+		DETAIL(3, box(&m, -18, -48 + nod, 72, 5, 5, 2, 20, 16, 24, L_SORT));            /* eyes  */
+		DETAIL(3, box(&m,  18, -48 + nod, 72, 5, 5, 2, 20, 16, 24, L_SORT));
 		box(&m, -27, -60 + nod, 48, 10, 4, 9, 200, 130, 120, L_SORT);        /* droopy ears */
 		box(&m,  27, -60 + nod, 48, 10, 4, 9, 200, 130, 120, L_SORT);
 		feet(&m, 24, 36, -36, step, -3);
@@ -1476,16 +1481,16 @@ static void draw_pet(void) {
 
 	case SP_CHINCHILLA:
 		box(&m, 0, -40, -6, 30, 34, 36, fr, fg, fb, L_SORT);                 /* body  */
-		box(&m, 0, -26, 6, 24, 22, 26, ar, ag, ab, L_SORT);                  /* belly */
+		DETAIL(1, box(&m, 0, -26, 6, 24, 22, 26, ar, ag, ab, L_SORT));                  /* belly */
 		box(&m, 0, -56 + nod, 34, 24, 22, 20, fr, fg, fb, L_SORT);           /* head  */
-		box(&m, 0, -48 + nod, 54, 9, 7, 3, ar, ag, ab, L_SORT);              /* muzzle */
-		box(&m, 0, -51 + nod, 57, 4, 3, 2, 220, 140, 150, L_SORT);
-		box(&m, -13, -62 + nod, 54, 4, 5, 2, 16, 12, 20, L_SORT);            /* eyes  */
-		box(&m,  13, -62 + nod, 54, 4, 5, 2, 16, 12, 20, L_SORT);
+		DETAIL(1, box(&m, 0, -48 + nod, 54, 9, 7, 3, ar, ag, ab, L_SORT));              /* muzzle */
+		DETAIL(3, box(&m, 0, -51 + nod, 57, 4, 3, 2, 220, 140, 150, L_SORT));
+		DETAIL(3, box(&m, -13, -62 + nod, 54, 4, 5, 2, 16, 12, 20, L_SORT));            /* eyes  */
+		DETAIL(3, box(&m,  13, -62 + nod, 54, 4, 5, 2, 16, 12, 20, L_SORT));
 		box(&m, -19, -90 + nod, 28, 14, 16, 3, fr, fg, fb, L_SORT);          /* big round ears */
 		box(&m,  19, -90 + nod, 28, 14, 16, 3, fr, fg, fb, L_SORT);
-		box(&m, -19, -90 + nod, 31, 9, 11, 1, 236, 170, 176, L_SORT);
-		box(&m,  19, -90 + nod, 31, 9, 11, 1, 236, 170, 176, L_SORT);
+		DETAIL(1, box(&m, -19, -90 + nod, 31, 9, 11, 1, 236, 170, 176, L_SORT));
+		DETAIL(1, box(&m,  19, -90 + nod, 31, 9, 11, 1, 236, 170, 176, L_SORT));
 		box(&m, 0, -22, -56, 10, 10, 24, fr, fg, fb, L_SORT);                /* bushy tail */
 		box(&m, 0, -44, -80, 10, 18, 9, fr, fg, fb, L_SORT);
 		feet(&m, 18, 22, -20, step, -4);
@@ -1495,17 +1500,17 @@ static void draw_pet(void) {
 		box(&m, 0, -24, -4, 24, 18, 36, fr, fg, fb, L_SORT);                 /* body  */
 		box(&m, -30, -16, -4, 8, 3, 30, fr, fg, fb, L_SORT);                 /* gliding membrane */
 		box(&m,  30, -16, -4, 8, 3, 30, fr, fg, fb, L_SORT);
-		box(&m, 0, -43, -4, 4, 2, 37, ar, ag, ab, L_SORT);                   /* back stripe */
+		DETAIL(1, box(&m, 0, -43, -4, 4, 2, 37, ar, ag, ab, L_SORT));                   /* back stripe */
 		box(&m, 0, -30 + nod, 36, 20, 18, 16, fr, fg, fb, L_SORT);           /* head  */
-		box(&m, 0, -49 + nod, 34, 3, 2, 16, ar, ag, ab, L_SORT);             /* head stripe */
-		box(&m, 0, -24 + nod, 53, 6, 6, 3, fr, fg, fb, L_SORT);              /* snout */
-		box(&m, 0, -26 + nod, 56, 3, 2, 2, 230, 140, 150, L_SORT);
-		box(&m, -10, -36 + nod, 51, 7, 7, 2, 10, 8, 14, L_SORT);             /* huge eyes */
-		box(&m,  10, -36 + nod, 51, 7, 7, 2, 10, 8, 14, L_SORT);
+		DETAIL(1, box(&m, 0, -49 + nod, 34, 3, 2, 16, ar, ag, ab, L_SORT));             /* head stripe */
+		DETAIL(1, box(&m, 0, -24 + nod, 53, 6, 6, 3, fr, fg, fb, L_SORT));              /* snout */
+		DETAIL(3, box(&m, 0, -26 + nod, 56, 3, 2, 2, 230, 140, 150, L_SORT));
+		DETAIL(3, box(&m, -10, -36 + nod, 51, 7, 7, 2, 10, 8, 14, L_SORT));             /* huge eyes */
+		DETAIL(3, box(&m,  10, -36 + nod, 51, 7, 7, 2, 10, 8, 14, L_SORT));
 		box(&m, -15, -55 + nod, 30, 7, 10, 2, 220, 160, 170, L_SORT);        /* ears  */
 		box(&m,  15, -55 + nod, 30, 7, 10, 2, 220, 160, 170, L_SORT);
 		box(&m, 0, -22, -64, 6, 6, 28, ar, ag, ab, L_SORT);                  /* long tail */
-		box(&m, 0, -22, -96, 7, 7, 5, 245, 245, 240, L_SORT);                /* white tip */
+		DETAIL(1, box(&m, 0, -22, -96, 7, 7, 5, 245, 245, 240, L_SORT));                /* white tip */
 		feet(&m, 16, 22, -22, step, -4);
 		break;
 	}
